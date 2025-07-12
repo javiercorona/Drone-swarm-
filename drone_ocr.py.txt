@@ -1,0 +1,127 @@
+# plugins/drone_ocr.py
+import cv2
+import numpy as np
+from PIL import Image
+import pytesseract
+from typing import Dict, Optional
+import io
+import logging
+from fastapi import UploadFile, File, APIRouter
+
+class DroneOCR:
+    def __init__(self):
+        # Tesseract config (optimized for aerial text)
+        self.config = r'--oem 3 --psm 6 -c tessedit_char_whitelist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.:- "'
+        self.preprocess_params = {
+            'blur_kernel': (3, 3),
+            'threshold_block': 11,
+            'threshold_C': 2
+        }
+        
+    async def extract_text(self, image: UploadFile) -> Dict:
+        """Process image and return structured OCR results"""
+        try:
+            # Convert UploadFile to OpenCV format
+            img = await self._file_to_cv2(image)
+            
+            # Preprocess for aerial text (low contrast, angled)
+            processed = self._preprocess_image(img)
+            
+            # Run OCR with region detection
+            results = pytesseract.image_to_data(
+                processed,
+                output_type=pytesseract.Output.DICT,
+                config=self.config
+            )
+            
+            return self._structure_results(results)
+        except Exception as e:
+            logging.error(f"OCR failed: {str(e)}")
+            raise HTTPException(500, "OCR processing error")
+
+    async def _file_to_cv2(self, file: UploadFile) -> np.ndarray:
+        """Convert FastAPI UploadFile to OpenCV image"""
+        contents = await file.read()
+        pil_img = Image.open(io.BytesIO(contents))
+        return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+    def _preprocess_image(self, img: np.ndarray) -> np.ndarray:
+        """Enhance text visibility from drone footage"""
+        # Convert to grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Remove noise (adaptive for varying light conditions)
+        blurred = cv2.GaussianBlur(
+            gray, 
+            self.preprocess_params['blur_kernel'], 
+            0
+        )
+        
+        # Adaptive thresholding
+        return cv2.adaptiveThreshold(
+            blurred,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            self.preprocess_params['threshold_block'],
+            self.preprocess_params['threshold_C']
+        )
+
+    def _structure_results(self, ocr_data: Dict) -> Dict:
+        """Convert Tesseract output to structured format"""
+        structured = []
+        for i in range(len(ocr_data['text'])):
+            if int(ocr_data['conf'][i]) > 60:  # Confidence threshold
+                structured.append({
+                    'text': ocr_data['text'][i],
+                    'confidence': float(ocr_data['conf'][i]),
+                    'bounding_box': {
+                        'x': int(ocr_data['left'][i]),
+                        'y': int(ocr_data['top'][i]),
+                        'width': int(ocr_data['width'][i]),
+                        'height': int(ocr_data['height'][i])
+                    }
+                })
+        
+        # Group by lines (y-coordinate clustering)
+        return self._group_by_lines(structured)
+
+    def _group_by_lines(self, text_objects: List[Dict]) -> Dict:
+        """Cluster detected text into logical lines"""
+        if not text_objects:
+            return {'lines': []}
+            
+        # Sort by y-position
+        sorted_objs = sorted(text_objects, key=lambda x: x['bounding_box']['y'])
+        
+        # Cluster with 10px y-tolerance
+        lines = []
+        current_line = [sorted_objs[0]]
+        
+        for obj in sorted_objs[1:]:
+            last_y = current_line[-1]['bounding_box']['y']
+            if abs(obj['bounding_box']['y'] - last_y) < 10:
+                current_line.append(obj)
+            else:
+                lines.append(current_line)
+                current_line = [obj]
+        lines.append(current_line)
+        
+        # Sort each line by x-position
+        return {
+            'lines': [
+                {
+                    'text': ' '.join([word['text'] for word in sorted(line, key=lambda x: x['bounding_box']['x'])]),
+                    'words': line
+                }
+                for line in lines
+            ]
+        }
+
+# FastAPI Endpoint
+router = APIRouter()
+ocr_engine = DroneOCR()
+
+@router.post("/extract-text")
+async def extract_text(image: UploadFile = File(...)):
+    return await ocr_engine.extract_text(image)

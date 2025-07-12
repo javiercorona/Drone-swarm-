@@ -1,0 +1,218 @@
+# ========================
+# DRONE RF SCANNER PLUGIN
+# ========================
+import asyncio
+from typing import Dict, List
+import numpy as np
+from rtlsdr import RtlSdr
+from scipy import signal
+import matplotlib.pyplot as plt
+from sklearn.cluster import DBSCAN
+from dataclasses import dataclass
+import pandas as pd
+
+@dataclass
+class DroneSignal:
+    frequency: float  # MHz
+    bandwidth: float  # MHz
+    signal_type: str  # 'Control', 'Video', 'Telemetry'
+    protocol: str     # 'DJI_OcuSync', 'WiFi', 'FHSS'
+    strength: float   # dBm
+    coordinates: tuple # (lat, lon) if geolocated
+
+class DroneRFScanner:
+    def __init__(self):
+        # Hardware configuration for cheap SDR
+        self.sdr = RtlSdr()
+        self.configure_rtlsdr()
+        
+        # Common drone frequencies (MHz)
+        self.drone_bands = {
+            'DJI': [2408, 2452, 5725, 5875],  # OcuSync frequencies
+            'FPV': [900, 1280, 1330, 2400, 5800],
+            'WiFi': [2412, 2437, 2462, 5745, 5825]
+        }
+        
+        # Protocol signatures (frequency hopping patterns)
+        self.protocols = {
+            'DJI_OcuSync': {'bw': 10, 'pattern': 'linear_sweep'},
+            'WiFi': {'bw': 20, 'pattern': 'static'},
+            'FHSS': {'bw': 1, 'pattern': 'pseudo_random'}
+        }
+        
+        self.detected_drones: Dict[str, List[DroneSignal]] = {}
+
+    def configure_rtlsdr(self):
+        """Configure cheap RTL-SDR dongle"""
+        self.sdr.sample_rate = 2.4e6  # Hz
+        self.sdr.center_freq = 2450e6  # Hz
+        self.sdr.gain = 'auto'
+        self.sdr.freq_correction = 60  # PPM
+
+    async def scan(self, duration: int = 10):
+        """
+        Perform spectrum scan for drone signals
+        :param duration: Scan time in seconds
+        """
+        samples = int(self.sdr.sample_rate * duration)
+        async for data in self.sdr.stream(samples):
+            self._analyze_samples(data)
+
+    def _analyze_samples(self, iq_samples):
+        """Process IQ samples to detect drone signals"""
+        # FFT analysis
+        psd = np.abs(np.fft.fft(iq_samples))**2
+        freqs = np.fft.fftfreq(len(iq_samples), 1/self.sdr.sample_rate)
+        freqs += self.sdr.center_freq
+        
+        # Detect peaks
+        peaks, _ = signal.find_peaks(psd, height=np.mean(psd)*3)
+        
+        # Cluster signals (DBSCAN for frequency hopping)
+        clustering = DBSCAN(eps=5e6, min_samples=3).fit(freqs[peaks].reshape(-1,1))
+        
+        for label in set(clustering.labels_):
+            if label == -1: continue
+            cluster_freqs = freqs[peaks][clustering.labels_ == label]
+            freq_center = np.mean(cluster_freqs) / 1e6  # Convert to MHz
+            bw = (np.max(cluster_freqs) - np.min(cluster_freqs)) / 1e6
+            
+            # Identify protocol
+            proto = self._identify_protocol(freq_center, bw, cluster_freqs)
+            
+            # Store detection
+            drone_id = f"drone_{len(self.detected_drones)+1}"
+            self.detected_drones.setdefault(drone_id, []).append(
+                DroneSignal(
+                    frequency=freq_center,
+                    bandwidth=bw,
+                    signal_type=self._get_signal_type(proto),
+                    protocol=proto,
+                    strength=np.mean(psd[peaks][clustering.labels_ == label]),
+                    coordinates=None  # Add GPS later
+                )
+            )
+
+    def _identify_protocol(self, freq: float, bw: float, freqs: np.ndarray) -> str:
+        """Match frequency characteristics to known protocols"""
+        # Check for DJI OcuSync
+        if 2400 <= freq <= 2480 and 8 <= bw <= 12:
+            return 'DJI_OcuSync'
+        
+        # Check WiFi
+        if any(abs(freq - wifi_freq) < 5 for wifi_freq in self.drone_bands['WiFi']):
+            return 'WiFi'
+        
+        # Frequency Hopping (Cheap FPV drones)
+        if len(freqs) > 5 and np.std(freqs) > 10e6:
+            return 'FHSS'
+        
+        return 'Unknown'
+
+    def _get_signal_type(self, protocol: str) -> str:
+        """Classify signal purpose based on protocol"""
+        if protocol == 'DJI_OcuSync':
+            return 'Video' if np.random.random() > 0.5 else 'Control'
+        return 'Telemetry'
+
+    def plot_detections(self):
+        """Generate visualization of detected signals"""
+        plt.figure(figsize=(12,6))
+        for drone_id, signals in self.detected_drones.items():
+            freqs = [s.frequency for s in signals]
+            strengths = [s.strength for s in signals]
+            plt.scatter(freqs, strengths, label=drone_id)
+        
+        plt.title("Drone RF Signal Detection")
+        plt.xlabel("Frequency (MHz)")
+        plt.ylabel("Signal Strength (dBm)")
+        plt.legend()
+        plt.grid()
+        plt.savefig('drone_scan.png')
+        plt.close()
+
+    def generate_report(self) -> pd.DataFrame:
+        """Create pandas dataframe of all detections"""
+        data = []
+        for drone_id, signals in self.detected_drones.items():
+            for sig in signals:
+                data.append({
+                    'Drone ID': drone_id,
+                    'Frequency (MHz)': sig.frequency,
+                    'Bandwidth (MHz)': sig.bandwidth,
+                    'Protocol': sig.protocol,
+                    'Signal Type': sig.signal_type,
+                    'Strength (dBm)': sig.strength
+                })
+        return pd.DataFrame(data)
+
+# ========================
+# FASTAPI INTEGRATION
+# ========================
+from fastapi import APIRouter
+
+router = APIRouter()
+scanner = DroneRFScanner()
+
+@router.post("/scan")
+async def start_scan(duration: int = 10):
+    """API endpoint to start RF scan"""
+    await scanner.scan(duration)
+    return {"status": "scan_complete"}
+
+@router.get("/results")
+async def get_results():
+    """Retrieve scan results"""
+    return {
+        "detected_drones": len(scanner.detected_drones),
+        "report": scanner.generate_report().to_dict(orient='records')
+    }
+
+@router.get("/visualize")
+async def visualize_scan():
+    """Generate and return scan visualization"""
+    scanner.plot_detections()
+    return FileResponse('drone_scan.png')
+
+# ========================
+# HARDWARE SETUP GUIDE
+# ========================
+"""
+Required Hardware (Total Cost < $50):
+1. RTL-SDR Dongle (RTL2832U) - $25
+   - Example: https://www.rtl-sdr.com/buy-rtl-sdr-dvb-t-dongles/
+2. Raspberry Pi 3/4 (Optional for mobile scanning) - $35
+3. 2.4GHz/5GHz Dipole Antenna - $10 (or make your own)
+
+Connection Diagram:
+[Antenna] → [RTL-SDR] → [USB Port] → [This Plugin]
+
+Calibration Steps:
+1. Install drivers:
+   pip install pyrtlsdr scipy matplotlib sklearn
+2. Run calibration:
+   rtl_test -p
+3. Set frequency correction in code (line 34)
+"""
+
+# ========================
+# CHEAP DRONE DETECTION TIPS
+# ========================
+"""
+Common Cheap Drones and Their Signatures:
+1. DJI Mini Series:
+   - 2.4GHz band with 10MHz BW
+   - Strong periodic control signals
+2. Holybro X500:
+   - 915MHz telemetry + 2.4GHz control
+3. Eachine Wizard FPV:
+   - Frequency hopping between 5 channels
+4. Ryze Tello:
+   - WiFi 2.4GHz with burst transmissions
+
+Detection Tricks:
+- Look for short, repetitive bursts (control signals)
+- Frequency hopping patterns indicate FPV drones
+- Strong continuous signals are usually video feeds
+- WiFi beacons reveal cheap camera drones
+"""

@@ -1,0 +1,119 @@
+# plugins/wildfire_detector.py
+import cv2
+import numpy as np
+from typing import Tuple, Optional
+from PIL import Image
+import io
+import logging
+
+class WildfireDetector:
+    def __init__(self):
+        self.model = self._load_model()
+        self.thresholds = {
+            'fire_temp': 150,  # Celsius
+            'smoke_contour_area': 500  # pixels
+        }
+        
+    def _load_model(self):
+        """Load pre-trained fire/smoke detection model"""
+        try:
+            # Using OpenCV's DNN for TensorFlow Lite model
+            return cv2.dnn.readNetFromTensorflow(
+                'models/fire_detection.pb',
+                'models/fire_detection.pbtxt'
+            )
+        except Exception as e:
+            logging.critical(f"Failed to load model: {str(e)}")
+            raise
+
+    def analyze_thermal_image(self, image_bytes: bytes) -> dict:
+        """Process thermal image for fire signatures"""
+        try:
+            # Convert bytes to OpenCV format
+            img = self._bytes_to_cv2(image_bytes)
+            
+            # Detect fire regions
+            fire_mask = self._detect_fire(img)
+            smoke_mask = self._detect_smoke(img)
+            
+            return {
+                "fire_detected": np.any(fire_mask),
+                "fire_percentage": np.mean(fire_mask) * 100,
+                "smoke_detected": np.any(smoke_mask),
+                "hotspots": self._find_hotspots(img, fire_mask)
+            }
+        except Exception as e:
+            logging.error(f"Thermal analysis failed: {str(e)}")
+            raise
+
+    def _bytes_to_cv2(self, image_bytes: bytes) -> np.ndarray:
+        """Convert image bytes to OpenCV format"""
+        img = Image.open(io.BytesIO(image_bytes))
+        return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+    def _detect_fire(self, img: np.ndarray) -> np.ndarray:
+        """Threshold-based fire detection"""
+        # Convert to grayscale (thermal intensity)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Normalize to 0-255 range assuming 8-bit thermal
+        normalized = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+        
+        # Threshold for fire temperatures
+        _, fire_mask = cv2.threshold(
+            normalized, 
+            self.thresholds['fire_temp'], 
+            255, 
+            cv2.THRESH_BINARY
+        )
+        return fire_mask > 0
+
+    def _detect_smoke(self, img: np.ndarray) -> np.ndarray:
+        """Contour-based smoke detection"""
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        
+        # Smoke typically has low saturation and high value
+        lower = np.array([0, 0, 200])
+        upper = np.array([180, 50, 255])
+        mask = cv2.inRange(hsv, lower, upper)
+        
+        # Filter small contours
+        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        smoke_mask = np.zeros_like(mask)
+        for cnt in contours:
+            if cv2.contourArea(cnt) > self.thresholds['smoke_contour_area']:
+                cv2.drawContours(smoke_mask, [cnt], -1, 255, -1)
+                
+        return smoke_mask > 0
+
+    def _find_hotspots(self, img: np.ndarray, mask: np.ndarray) -> list:
+        """Locate fire epicenters"""
+        y_coords, x_coords = np.where(mask)
+        if len(x_coords) == 0:
+            return []
+            
+        # Cluster hotspots using DBSCAN
+        coords = np.column_stack((x_coords, y_coords))
+        clustering = DBSCAN(eps=50, min_samples=10).fit(coords)
+        
+        hotspots = []
+        for label in set(clustering.labels_):
+            if label == -1:
+                continue
+            cluster_points = coords[clustering.labels_ == label]
+            center = np.mean(cluster_points, axis=0)
+            intensity = np.mean(img[cluster_points[:,1], cluster_points[:,0]])
+            hotspots.append({
+                "x": int(center[0]),
+                "y": int(center[1]),
+                "intensity": float(intensity)
+            })
+        return hotspots
+
+# FastAPI Endpoint
+router = APIRouter()
+detector = WildfireDetector()
+
+@router.post("/detect-wildfire")
+async def detect_wildfire(image: UploadFile = File(...)):
+    return detector.analyze_thermal_image(await image.read())

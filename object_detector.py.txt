@@ -1,0 +1,80 @@
+# plugins/object_detector.py
+import cv2
+import numpy as np
+from ultralytics import YOLO
+from typing import Dict, List
+import logging
+from fastapi import UploadFile, File, APIRouter
+from dataclasses import dataclass
+
+@dataclass
+class Detection:
+    label: str
+    confidence: float
+    bbox: List[int]  # [x1, y1, x2, y2]
+    class_id: int
+
+class ObjectDetector:
+    def __init__(self):
+        self.model = YOLO("yolov8n.pt")  # Nano version for drones
+        self.classes = self._load_coco_classes()
+        self.edge_optimized = False
+        
+    def _load_coco_classes(self) -> Dict[int, str]:
+        """COCO dataset class labels"""
+        return {
+            0: 'person', 2: 'car', 3: 'motorcycle', 
+            5: 'bus', 7: 'truck', 16: 'dog'
+            # Add drone-specific classes as needed
+        }
+
+    async def detect_objects(self, image: UploadFile, conf: float = 0.5) -> List[Detection]:
+        """Run inference on uploaded image"""
+        try:
+            # Convert to OpenCV format
+            img = await self._file_to_cv2(image)
+            
+            # Optimize for edge if not done
+            if not self.edge_optimized:
+                self._optimize_for_edge(img.shape)
+            
+            # Inference
+            results = self.model(img, imgsz=640, conf=conf)
+            
+            # Parse results
+            detections = []
+            for result in results:
+                for box in result.boxes:
+                    detections.append(Detection(
+                        label=self.classes.get(int(box.cls), "unknown"),
+                        confidence=float(box.conf),
+                        bbox=box.xyxy[0].tolist(),
+                        class_id=int(box.cls)
+                    ))
+            return detections
+        except Exception as e:
+            logging.error(f"Detection failed: {str(e)}")
+            raise
+
+    def _optimize_for_edge(self, img_shape: tuple):
+        """Convert model to TensorRT for Jetson"""
+        if img_shape[0] > 0:  # Dummy condition
+            self.model.export(format="engine")  # TensorRT
+            self.model = YOLO("yolov8n.engine")
+            self.edge_optimized = True
+
+    async def _file_to_cv2(self, file: UploadFile) -> np.ndarray:
+        """FastAPI UploadFile to OpenCV"""
+        contents = await file.read()
+        return cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
+
+# FastAPI Endpoint
+router = APIRouter()
+detector = ObjectDetector()
+
+@router.post("/detect")
+async def detect_objects(
+    image: UploadFile = File(...), 
+    confidence: float = 0.5
+):
+    return await detector.detect_objects(image, confidence)

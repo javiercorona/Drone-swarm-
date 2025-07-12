@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Drone RF Scanner</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .signal-card {
+            transition: all 0.3s;
+        }
+        .signal-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 20px rgba(0,0,0,0.1);
+        }
+        #spectrum-plot {
+            height: 500px;
+        }
+        .protocol-badge {
+            font-size: 0.75em;
+        }
+    </style>
+</head>
+<body>
+    <div class="container-fluid py-4">
+        <div class="row mb-4">
+            <div class="col-12">
+                <h1 class="display-4">
+                    <i class="bi bi-wifi"></i> Drone RF Scanner
+                </h1>
+                <p class="lead">Real-time detection of drone signals using SDR</p>
+            </div>
+        </div>
+
+        <!-- Control Panel -->
+        <div class="row mb-4">
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-body">
+                        <h5 class="card-title">
+                            <i class="bi bi-gear"></i> Scanner Controls
+                        </h5>
+                        <div class="row g-3">
+                            <div class="col-md-6">
+                                <label class="form-label">Scan Duration (sec)</label>
+                                <input type="number" id="scanDuration" class="form-control" value="10" min="1" max="60">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label">Frequency Band</label>
+                                <select id="frequencyBand" class="form-select">
+                                    <option value="2400">2.4GHz (Consumer Drones)</option>
+                                    <option value="5800">5.8GHz (FPV Drones)</option>
+                                    <option value="900">900MHz (Long Range)</option>
+                                </select>
+                            </div>
+                            <div class="col-12">
+                                <button id="startScan" class="btn btn-primary w-100">
+                                    <i class="bi bi-play-circle"></i> Start Scan
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-body">
+                        <h5 class="card-title">
+                            <i class="bi bi-speedometer2"></i> System Status
+                        </h5>
+                        <div class="row">
+                            <div class="col-6">
+                                <div class="d-flex align-items-center">
+                                    <div class="me-3 text-primary">
+                                        <i class="bi bi-wifi" style="font-size: 2rem;"></i>
+                                    </div>
+                                    <div>
+                                        <h6 class="mb-0">SDR Device</h6>
+                                        <span id="sdrStatus" class="text-success">Connected</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-6">
+                                <div class="d-flex align-items-center">
+                                    <div class="me-3 text-info">
+                                        <i class="bi bi-cpu" style="font-size: 2rem;"></i>
+                                    </div>
+                                    <div>
+                                        <h6 class="mb-0">CPU Load</h6>
+                                        <span id="cpuLoad">15%</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Spectrum Plot -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-body">
+                        <h5 class="card-title">
+                            <i class="bi bi-graph-up"></i> Live Spectrum
+                        </h5>
+                        <div id="spectrum-plot"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Detection Results -->
+        <div class="row" id="detectionResults">
+            <!-- Dynamic cards will appear here -->
+            <div class="col-12">
+                <div class="alert alert-info">
+                    <i class="bi bi-info-circle"></i> No drone signals detected yet. Start a scan to begin.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // WebSocket connection
+        const ws = new WebSocket(`ws://${window.location.host}/ws/scanner`);
+        
+        // DOM Elements
+        const startScanBtn = document.getElementById('startScan');
+        const scanDuration = document.getElementById('scanDuration');
+        const frequencyBand = document.getElementById('frequencyBand');
+        const detectionResults = document.getElementById('detectionResults');
+        const spectrumPlot = document.getElementById('spectrum-plot');
+
+        // WebSocket handlers
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            
+            if(data.type === 'spectrum_data') {
+                updateSpectrumPlot(data.frequencies, data.power);
+            }
+            else if(data.type === 'detection') {
+                updateDetectionCards(data.drones);
+            }
+            else if(data.type === 'system_status') {
+                document.getElementById('cpuLoad').textContent = `${data.cpu_load}%`;
+            }
+        };
+
+        // Event listeners
+        startScanBtn.addEventListener('click', () => {
+            const duration = scanDuration.value;
+            const freq = frequencyBand.value;
+            ws.send(JSON.stringify({
+                action: 'start_scan',
+                duration: duration,
+                frequency: freq
+            }));
+        });
+
+        // Update UI functions
+        function updateSpectrumPlot(frequencies, power) {
+            Plotly.newPlot(spectrumPlot, [{
+                x: frequencies,
+                y: power,
+                type: 'line',
+                line: {color: '#0d6efd'}
+            }], {
+                title: 'RF Spectrum Analysis',
+                xaxis: {title: 'Frequency (MHz)'},
+                yaxis: {title: 'Power (dBm)'},
+                margin: {t: 30, l: 50, r: 30, b: 50}
+            });
+        }
+
+        function updateDetectionCards(drones) {
+            if(drones.length === 0) {
+                detectionResults.innerHTML = `
+                    <div class="col-12">
+                        <div class="alert alert-info">
+                            <i class="bi bi-info-circle"></i> No drone signals detected.
+                        </div>
+                    </div>
+                `;
+                return;
+            }
+
+            let cardsHtml = '';
+            drones.forEach(drone => {
+                const signalTypeClass = {
+                    'Control': 'bg-primary',
+                    'Video': 'bg-success',
+                    'Telemetry': 'bg-info'
+                }[drone.signal_type] || 'bg-secondary';
+
+                cardsHtml += `
+                    <div class="col-md-4 mb-3">
+                        <div class="card signal-card h-100">
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <span>Drone ${drone.id}</span>
+                                <span class="badge ${signalTypeClass} protocol-badge">
+                                    ${drone.signal_type}
+                                </span>
+                            </div>
+                            <div class="card-body">
+                                <div class="row">
+                                    <div class="col-6">
+                                        <small class="text-muted">Frequency</small>
+                                        <h5>${drone.frequency} MHz</h5>
+                                    </div>
+                                    <div class="col-6">
+                                        <small class="text-muted">Strength</small>
+                                        <h5>${drone.strength} dBm</h5>
+                                    </div>
+                                </div>
+                                <div class="row mt-2">
+                                    <div class="col-6">
+                                        <small class="text-muted">Protocol</small>
+                                        <p>${drone.protocol}</p>
+                                    </div>
+                                    <div class="col-6">
+                                        <small class="text-muted">Bandwidth</small>
+                                        <p>${drone.bandwidth} MHz</p>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="card-footer bg-transparent">
+                                <small class="text-muted">
+                                    Last detected: ${new Date().toLocaleTimeString()}
+                                </small>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            });
+
+            detectionResults.innerHTML = cardsHtml;
+        }
+
+        // Initialize empty plot
+        updateSpectrumPlot([], []);
+    </script>
+</body>
+</html>
